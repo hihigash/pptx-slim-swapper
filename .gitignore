@@ -32,8 +32,8 @@ media/
 swap-manifest.json
 
 # Test data directory (may contain sensitive files)
-data/
-# ただしREADMEは含める
+# README以外のファイルを除外
+data/*
 !data/README.md
 
 # OS files
