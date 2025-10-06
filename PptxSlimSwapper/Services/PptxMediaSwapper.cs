@@ -232,6 +232,22 @@ public class PptxMediaSwapper
             originalData = memoryStream.ToArray();
         }
 
+        // データのハッシュを計算
+        var dataHash = Models.MediaInfo.ComputeHash(originalData);
+
+        // 画像の寸法を取得 (可能な場合)
+        (int Width, int Height)? dimensions = null;
+        try
+        {
+            using var ms = new MemoryStream(originalData);
+            using var image = System.Drawing.Image.FromStream(ms);
+            dimensions = (image.Width, image.Height);
+        }
+        catch
+        {
+            // 寸法取得失敗時は無視
+        }
+
         // メディア情報を作成
         var mediaInfo = new MediaInfo
         {
@@ -241,7 +257,9 @@ public class PptxMediaSwapper
             ContentType = imagePart.ContentType,
             OriginalSize = originalData.Length,
             PartUri = imagePart.Uri?.ToString() ?? "",
-            SavedFilePath = Path.Combine(MediaFolderName, $"{Guid.NewGuid()}{GetExtensionFromContentType(imagePart.ContentType)}")
+            SavedFilePath = Path.Combine(MediaFolderName, $"{Guid.NewGuid()}{GetExtensionFromContentType(imagePart.ContentType)}"),
+            DataHash = dataHash,
+            ImageDimensions = dimensions
         };
 
         // 元の画像を保存
@@ -252,7 +270,8 @@ public class PptxMediaSwapper
         var placeholderData = PlaceholderGenerator.GenerateImagePlaceholder(
             mediaInfo.Id,
             mediaInfo.OriginalFileName,
-            mediaInfo.ContentType
+            mediaInfo.ContentType,
+            mediaInfo.DataHash
         );
 
         using var placeholderStream = new MemoryStream(placeholderData);
@@ -272,6 +291,9 @@ public class PptxMediaSwapper
             originalData = memoryStream.ToArray();
         }
 
+        // データのハッシュを計算
+        var dataHash = Models.MediaInfo.ComputeHash(originalData);
+
         // メディア情報を作成
         var mediaInfo = new MediaInfo
         {
@@ -281,7 +303,8 @@ public class PptxMediaSwapper
             ContentType = videoPart.ContentType,
             OriginalSize = originalData.Length,
             PartUri = videoPart.Uri?.ToString() ?? "",
-            SavedFilePath = Path.Combine(MediaFolderName, $"{Guid.NewGuid()}{GetExtensionFromContentType(videoPart.ContentType)}")
+            SavedFilePath = Path.Combine(MediaFolderName, $"{Guid.NewGuid()}{GetExtensionFromContentType(videoPart.ContentType)}"),
+            DataHash = dataHash
         };
 
         // 元の動画を保存
@@ -292,7 +315,8 @@ public class PptxMediaSwapper
         var placeholderData = PlaceholderGenerator.GenerateVideoPlaceholder(
             mediaInfo.Id,
             mediaInfo.OriginalFileName,
-            mediaInfo.ContentType
+            mediaInfo.ContentType,
+            mediaInfo.DataHash
         );
 
         using var placeholderStream = new MemoryStream(placeholderData);
@@ -350,26 +374,23 @@ public class PptxMediaSwapper
             }
         }
 
-        // 画像パーツを検索 - URI基準で重複除外してから検索
-        var imageParts = allImageParts
-            .GroupBy(ip => ip.Uri?.ToString())
-            .Where(g => g.Key == mediaInfo.PartUri)
-            .SelectMany(g => g) // グループ内の全てのパーツを取得
-            .ToList();
+        // 柔軟なマッチングで画像パーツを検索
+        var targetPart = await FindImagePartByFlexibleMatchingAsync(allImageParts, mediaInfo);
 
-        if (imageParts.Count == 0)
+        if (targetPart == null)
         {
-            Console.WriteLine($"警告: 画像パーツが見つかりません: {mediaInfo.PartUri}");
+            Console.WriteLine($"警告: 画像パーツが見つかりません: {mediaInfo.PartUri} (ID: {mediaInfo.Id})");
             return;
         }
 
         // 保存されていた元の画像データを読み込む
         var originalData = await File.ReadAllBytesAsync(savedFilePath);
 
-        // 該当するパーツの最初の1つだけに復元（同じURIは同じ実体を指す）
-        var firstPart = imageParts.First();
+        // 復元
         using var stream = new MemoryStream(originalData);
-        firstPart.FeedData(stream);
+        targetPart.FeedData(stream);
+        
+        Console.WriteLine($"復元成功: {mediaInfo.OriginalFileName} (ID: {mediaInfo.Id})");
     }
 
     private static async Task RestoreVideoPartAsync(
@@ -433,31 +454,162 @@ public class PptxMediaSwapper
             }
         }
 
-        // 動画パーツを検索 - URI基準で重複除外してから検索
-        var videoParts = allVideoParts
-            .GroupBy(vp => vp.Uri?.ToString())
-            .Where(g => g.Key == mediaInfo.PartUri)
-            .SelectMany(g => g) // グループ内の全てのパーツを取得
-            .ToList();
+        // 柔軟なマッチングで動画パーツを検索
+        var targetPart = await FindVideoPartByFlexibleMatchingAsync(allVideoParts, mediaInfo);
 
-        if (videoParts.Count == 0)
+        if (targetPart == null)
         {
-            Console.WriteLine($"警告: 動画パーツが見つかりません: {mediaInfo.PartUri}");
+            Console.WriteLine($"警告: 動画パーツが見つかりません: {mediaInfo.PartUri} (ID: {mediaInfo.Id})");
             return;
         }
 
         // 保存されていた元の動画データを読み込む
         var originalData = await File.ReadAllBytesAsync(savedFilePath);
 
-        // 該当するパーツの最初の1つだけに復元（同じURIは同じ実体を指す）
-        var firstPart = videoParts.First();
+        // 復元
         using var stream = new MemoryStream(originalData);
-        firstPart.FeedData(stream);
+        targetPart.FeedData(stream);
+        
+        Console.WriteLine($"復元成功: {mediaInfo.OriginalFileName} (ID: {mediaInfo.Id})");
     }
 
     private static string GetFileNameFromUri(string uri)
     {
         return Path.GetFileName(uri.Replace('/', Path.DirectorySeparatorChar));
+    }
+
+    /// <summary>
+    /// 柔軟なマッチング戦略で画像パーツを検索
+    /// </summary>
+    private static async Task<ImagePart?> FindImagePartByFlexibleMatchingAsync(
+        List<ImagePart> allImageParts,
+        MediaInfo mediaInfo)
+    {
+        // 重複を除外
+        var uniqueParts = allImageParts
+            .GroupBy(ip => ip.Uri?.ToString())
+            .Select(g => g.First())
+            .ToList();
+
+        // 戦略1: URI完全一致 (最優先)
+        var exactMatch = uniqueParts.FirstOrDefault(ip => ip.Uri?.ToString() == mediaInfo.PartUri);
+        if (exactMatch != null)
+        {
+            Console.WriteLine($"  → URI完全一致でマッチング: {mediaInfo.PartUri}");
+            return exactMatch;
+        }
+
+        // 戦略2: プレースホルダーのメタデータからIDを照合
+        Console.WriteLine($"  → URI一致なし。メタデータでマッチング試行中...");
+        foreach (var part in uniqueParts.Where(p => p.ContentType.StartsWith("image/")))
+        {
+            try
+            {
+                using var stream = part.GetStream();
+                using var ms = new MemoryStream();
+                await stream.CopyToAsync(ms);
+                var imageData = ms.ToArray();
+
+                var metadata = PlaceholderGenerator.ExtractMetadataFromPng(imageData);
+                if (metadata != null && metadata.Id == mediaInfo.Id)
+                {
+                    Console.WriteLine($"  → メタデータID一致でマッチング: {mediaInfo.Id}");
+                    return part;
+                }
+            }
+            catch
+            {
+                // メタデータ読み取り失敗は無視
+            }
+        }
+
+        // 戦略3: ContentTypeとファイル名の組み合わせ
+        Console.WriteLine($"  → ファイル名とContentTypeでマッチング試行中...");
+        var originalName = Path.GetFileNameWithoutExtension(mediaInfo.OriginalFileName);
+        var similarMatch = uniqueParts
+            .Where(ip => ip.ContentType == mediaInfo.ContentType)
+            .FirstOrDefault(ip =>
+            {
+                var fileName = GetFileNameFromUri(ip.Uri?.ToString() ?? "");
+                return Path.GetFileNameWithoutExtension(fileName)
+                    .Contains(originalName, StringComparison.OrdinalIgnoreCase);
+            });
+
+        if (similarMatch != null)
+        {
+            Console.WriteLine($"  → ファイル名類似性でマッチング: {GetFileNameFromUri(similarMatch.Uri?.ToString() ?? "")}");
+        }
+
+        return similarMatch;
+    }
+
+    /// <summary>
+    /// 柔軟なマッチング戦略で動画パーツを検索
+    /// </summary>
+    private static async Task<DataPart?> FindVideoPartByFlexibleMatchingAsync(
+        List<DataPart> allVideoParts,
+        MediaInfo mediaInfo)
+    {
+        // 重複を除外
+        var uniqueParts = allVideoParts
+            .GroupBy(vp => vp.Uri?.ToString())
+            .Select(g => g.First())
+            .ToList();
+
+        // 戦略1: URI完全一致 (最優先)
+        var exactMatch = uniqueParts.FirstOrDefault(vp => vp.Uri?.ToString() == mediaInfo.PartUri);
+        if (exactMatch != null)
+        {
+            Console.WriteLine($"  → URI完全一致でマッチング: {mediaInfo.PartUri}");
+            return exactMatch;
+        }
+
+        // 戦略2: プレースホルダーのメタデータからIDを照合 (動画もPNG画像で代替しているため)
+        Console.WriteLine($"  → URI一致なし。メタデータでマッチング試行中...");
+        foreach (var part in uniqueParts)
+        {
+            try
+            {
+                using var stream = part.GetStream();
+                using var ms = new MemoryStream();
+                await stream.CopyToAsync(ms);
+                var data = ms.ToArray();
+
+                // PNG形式かチェック
+                if (data.Length > 8 && data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47)
+                {
+                    var metadata = PlaceholderGenerator.ExtractMetadataFromPng(data);
+                    if (metadata != null && metadata.Id == mediaInfo.Id)
+                    {
+                        Console.WriteLine($"  → メタデータID一致でマッチング: {mediaInfo.Id}");
+                        return part;
+                    }
+                }
+            }
+            catch
+            {
+                // メタデータ読み取り失敗は無視
+            }
+        }
+
+        // 戦略3: ContentTypeとファイル名の組み合わせ
+        Console.WriteLine($"  → ファイル名とContentTypeでマッチング試行中...");
+        var originalName = Path.GetFileNameWithoutExtension(mediaInfo.OriginalFileName);
+        var similarMatch = uniqueParts
+            .Where(vp => vp.ContentType == mediaInfo.ContentType)
+            .FirstOrDefault(vp =>
+            {
+                var fileName = GetFileNameFromUri(vp.Uri?.ToString() ?? "");
+                return Path.GetFileNameWithoutExtension(fileName)
+                    .Contains(originalName, StringComparison.OrdinalIgnoreCase);
+            });
+
+        if (similarMatch != null)
+        {
+            Console.WriteLine($"  → ファイル名類似性でマッチング: {GetFileNameFromUri(similarMatch.Uri?.ToString() ?? "")}");
+        }
+
+        return similarMatch;
     }
 
     private static string GetExtensionFromContentType(string contentType)

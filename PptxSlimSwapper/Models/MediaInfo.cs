@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+
 namespace PptxSlimSwapper.Models;
 
 /// <summary>
@@ -25,4 +27,20 @@ public class MediaInfo
 
     /// <summary>保存された外部ファイルパス</summary>
     public string SavedFilePath { get; set; } = string.Empty;
+
+    /// <summary>元のデータのSHA256ハッシュ (復元時の検証用)</summary>
+    public string? DataHash { get; set; }
+
+    /// <summary>画像の寸法 (復元時のマッチング精度向上用)</summary>
+    public (int Width, int Height)? ImageDimensions { get; set; }
+
+    /// <summary>
+    /// データのSHA256ハッシュを計算
+    /// </summary>
+    public static string ComputeHash(byte[] data)
+    {
+        using var sha256 = SHA256.Create();
+        var hash = sha256.ComputeHash(data);
+        return Convert.ToBase64String(hash);
+    }
 }
