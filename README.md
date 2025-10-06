@@ -126,10 +126,6 @@ PptxSlimSwapper/
 4. 保存されていた元のメディアデータで上書き
 5. 復元済みPPTXファイルとして保存
 
-## ライセンス
-
-MIT License
-
 ## 必要な依存関係
 
 - DocumentFormat.OpenXml 3.2.0
